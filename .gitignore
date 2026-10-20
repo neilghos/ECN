@@ -1,0 +1,37 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environments & IDEs
+.idea/
+.vscode/
+.DS_Store
+*/.DS_Store
+.ipynb_checkpoints
+.env
+.venv
+venv/
+ENV/
+
+# Model checkpoints & logs
+saved_models/
+*.pkl
+*.pt
+*.pth
+*.log
+logs/
+benchmark_logs/
+
+# Raw and processed datasets
+DG_data/
+processed_data/
+*.npy
+
+# Papers and large binaries
+2303.13047v3.pdf
+
+# Track saved results
+!saved_results/
+!saved_results/**
