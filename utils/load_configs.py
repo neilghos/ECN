@@ -238,6 +238,10 @@ def load_link_prediction_best_configs(args: argparse.Namespace):
             args.dropout = 0.0
         else:
             args.dropout = 0.1
+    elif args.model_name == 'EvidGNN':
+        args.num_layers = 2
+        args.dropout = 0.1
+        args.sample_neighbor_strategy = 'recent'
     else:
         raise ValueError(f"Wrong value for model_name {args.model_name}!")
 

@@ -234,7 +234,14 @@ if __name__ == "__main__":
                                                                           node_interact_times=batch_node_interact_times,
                                                                           num_neighbors=args.num_neighbors,
                                                                           time_gap=args.time_gap)
-                elif args.model_name in ['DyGFormer', 'EvidGNN']:
+                elif args.model_name == 'EvidGNN':
+                    batch_src_node_embeddings, batch_dst_node_embeddings =                         model[0].compute_src_dst_node_temporal_embeddings(src_node_ids=batch_src_node_ids,
+                                                                          dst_node_ids=batch_dst_node_ids,
+                                                                          node_interact_times=batch_node_interact_times)
+                    batch_neg_src_node_embeddings = batch_src_node_embeddings
+                    batch_neg_dst_node_embeddings = model[0].compute_node_temporal_embeddings(node_ids=batch_neg_dst_node_ids,
+                                                                                              node_interact_times=batch_node_interact_times)
+                elif args.model_name in ['DyGFormer']:
                     # get temporal embedding of source and destination nodes
                     # two Tensors, with shape (batch_size, node_feat_dim)
                     batch_src_node_embeddings, batch_dst_node_embeddings = \
