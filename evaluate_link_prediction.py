@@ -13,6 +13,7 @@ from models.CAWN import CAWN
 from models.TCL import TCL
 from models.GraphMixer import GraphMixer
 from models.DyGFormer import DyGFormer
+from models.EvidGNN import EvidGNN
 from models.modules import MergeLayer
 from utils.utils import set_random_seed, convert_to_gpu, get_parameter_sizes
 from utils.utils import get_neighbor_sampler, NegativeEdgeSampler
@@ -131,6 +132,14 @@ if __name__ == "__main__":
                                              time_feat_dim=args.time_feat_dim, channel_embedding_dim=args.channel_embedding_dim, patch_size=args.patch_size,
                                              num_layers=args.num_layers, num_heads=args.num_heads, dropout=args.dropout,
                                              max_input_sequence_length=args.max_input_sequence_length, device=args.device)
+            elif args.model_name == 'EvidGNN':
+                dynamic_backbone = EvidGNN(node_raw_features=node_raw_features, edge_raw_features=edge_raw_features,
+                                           neighbor_sampler=full_neighbor_sampler,
+                                           train_data=train_data, embedding_dim=node_raw_features.shape[1],
+                                           num_layers=args.num_layers, num_evidence_graphs=args.num_evidence_graphs,
+                                           peripheral_sample_ratio=args.peripheral_sample_ratio, top_k_ratio=args.top_k_ratio,
+                                           contrastive_weight=args.contrastive_weight, temperature=args.temperature,
+                                           dropout=args.dropout, encoder_type=args.encoder_type, device=args.device)
             else:
                 raise ValueError(f"Wrong value for model_name {args.model_name}!")
             link_predictor = MergeLayer(input_dim1=node_raw_features.shape[1], input_dim2=node_raw_features.shape[1],

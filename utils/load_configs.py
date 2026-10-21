@@ -40,7 +40,7 @@ def get_link_prediction_args(is_evaluation: bool = False):
     parser.add_argument('--num_evidence_graphs', type=int, default=4, help='number of evidence graphs')
     parser.add_argument('--peripheral_sample_ratio', type=float, default=0.6, help='ratio of peripheral nodes in each evidence graph')
     parser.add_argument('--top_k_ratio', type=float, default=0.10, help='ratio of backbone anchor nodes')
-    parser.add_argument('--contrastive_weight', type=float, default=0.1, help='weight of contrastive loss')
+    parser.add_argument('--contrastive_weight', type=float, default=1.0, help='weight of contrastive loss')
     parser.add_argument('--temperature', type=float, default=0.2, help='temperature for InfoNCE contrastive loss')
     parser.add_argument('--learning_rate', type=float, default=0.0001, help='learning rate')
     parser.add_argument('--dropout', type=float, default=0.1, help='dropout rate')

@@ -10,17 +10,33 @@ import torch.nn.functional as F
 from utils.utils import find_anchor_nodes
 from utils.DataLoader import Data
 from models.modules import TimeEncoder
-from models.fno_modules import FNO1DBlock, MultiHorizonSampler
+from models.fno_modules import FNO1DBlock, STL5HorizonSampler
 
 
 class EvidGNN(nn.Module):
     """
-    Physics-Informed Spectral Evidence Graph Network (EvidGNN).
-    Replaces static graph message-passing with a 1D Fourier Neural Operator (FNO-1D)
-    acting on three chronological evidence horizons:
-      - Horizon 0: Short-term burst window (last 10% of time)
-      - Horizon 1: Medium-term trend window (last 30% of time)
-      - Horizon 2: Long-term anchor backbone (entire history)
+    STL-Decomposition-Guided Dynamic Graph Transformer with Fourier Neural Operators.
+
+    Architecture:
+      1. STL Physical Prior Extractor:
+         Extracts 8-dim physical priors (trend velocity, diurnal phase, weekly phase,
+         Fano burstiness, recency decay, activity density).
+      2. 5-Horizon Physical Partitioner:
+         Partitions interaction streams into 5 physical regimes:
+           - Horizon 0: Seasonality View (Diurnal/periodic phase alignment to query time)
+           - Horizon 1: Trend View (Macroscopic decimation across life-cycle + anchor backbone)
+           - Horizon 2: Short Bursts View (< 1 hour or 5% span rapid-fire clusters)
+           - Horizon 3: Medium Bursts View (< 1-2 days or 20% span episodic surges)
+           - Horizon 4: Long Bursts View (< 7-14 days or 50% span sustained surges)
+      3. FNO-1D Spectral Operators:
+         Continuous Fourier frequency filtering per horizon via complex mode multiplication.
+      4. Dynamic Graph Transformer:
+         Multi-Head Self-Attention over the 5 physical horizon tokens, conditioned on the
+         STL physical priors and horizon positional embeddings.
+      5. Multi-Scale Contrastive Learning:
+         InfoNCE across canonical scale pairs (Season-Trend, Trend-Long, Short-Med, Med-Long, Season-Short).
+      6. Output Node Representation:
+         Fusion into node_feat_dim for downstream MergeLayer link prediction.
     """
     def __init__(self, node_raw_features: np.ndarray, edge_raw_features: np.ndarray,
                  neighbor_sampler = None,
@@ -40,6 +56,8 @@ class EvidGNN(nn.Module):
                  temperature: float = 0.2,
                  contrastive_weight: float = 0.1,
                  dropout: float = 0.1,
+                 transformer_layers: int = 1,
+                 transformer_heads: int = 4,
                  device: str = "cpu",
                  **kwargs):
         super(EvidGNN, self).__init__()
@@ -77,7 +95,7 @@ class EvidGNN(nn.Module):
         self.node_feat_dim = node_raw_features.shape[1] if node_raw_features is not None else embedding_dim
         self.edge_feat_dim = edge_raw_features.shape[1] if self.has_edge_features else 0
 
-        print(f"[EvidGNN (FNO-1D)] Initialized Spectral Evidence Operator | Node Dim: {self.node_feat_dim} | Edge Dim: {self.edge_feat_dim} | Hidden Dim: {self.hidden_dim} | Modes: {self.fno_modes}")
+        print(f"[EvidGNN (Dynamic Graph Transformer + FNO-1D)] Initialized STL-Guided Architecture | Node Dim: {self.node_feat_dim} | Edge Dim: {self.edge_feat_dim} | Hidden Dim: {self.hidden_dim} | Modes: {self.fno_modes} | Transformer Heads: {transformer_heads}")
 
         # 2. Identify persistent backbone anchors
         self.anchor_node_ids, _ = find_anchor_nodes(
@@ -91,11 +109,12 @@ class EvidGNN(nn.Module):
         )
         print(f"  - Anchor backbone nodes identified: {len(self.anchor_node_ids)}")
 
-        # 3. Setup Multi-Scale Chronological Horizon Sampler
+        # 3. Setup STL 5-Horizon Sampler & Physical Prior Extractor
         self.neighbor_sampler = neighbor_sampler
-        self.horizon_sampler = MultiHorizonSampler(
+        self.horizon_sampler = STL5HorizonSampler(
             neighbor_sampler=neighbor_sampler,
             anchor_node_ids=self.anchor_node_ids,
+            num_total_nodes=self.num_total_nodes,
             seq_len=self.seq_len
         )
 
@@ -122,15 +141,29 @@ class EvidGNN(nn.Module):
             for _ in range(self.num_layers)
         ])
 
-        # 6. Multi-Horizon Fusion Layer: [Burst; Trend; Anchor] -> Output Node Representation
+        # 6. STL Physical Prior Projector and Horizon Positional Embeddings
+        self.prior_proj = nn.Linear(8, self.hidden_dim)
+        self.horizon_pos_emb = nn.Embedding(5, self.hidden_dim)
+
+        # 7. Dynamic Graph Transformer (Self-Attention over the 5 Physical View Tokens)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.hidden_dim,
+            nhead=transformer_heads,
+            dim_feedforward=2 * self.hidden_dim,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=transformer_layers)
+
+        # 8. Multi-Horizon Fusion Layer: [Attended 5 Tokens] -> Output Node Representation
         self.fusion = nn.Sequential(
-            nn.Linear(3 * self.hidden_dim, self.hidden_dim),
+            nn.Linear(5 * self.hidden_dim, self.hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(self.hidden_dim, self.node_feat_dim)
         )
 
-        # 7. Contrastive Projection Head for Multi-Horizon InfoNCE
+        # 9. Contrastive Projection Head for Multi-Horizon InfoNCE
         self.proj_head = nn.Sequential(
             nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.ReLU(),
@@ -153,12 +186,14 @@ class EvidGNN(nn.Module):
 
     def _encode_node_horizons(self, node_ids: np.ndarray, node_interact_times: np.ndarray):
         """
-        Extracts multi-scale evidence horizons and passes each through the FNO-1D operator.
+        Extracts 5 physical evidence horizons and passes each through the FNO-1D operator.
         Returns:
-            z0 (Burst), z1 (Trend), z2 (Anchor): Tensors of shape (Batch, hidden_dim)
+            tokens: Tensor of shape (Batch, 5, hidden_dim)
+            priors: Tensor of shape (Batch, 8)
         """
         B = len(node_ids)
-        h_nbrs, h_edges, h_times = self.horizon_sampler.sample_multiscale_horizons(node_ids, node_interact_times)
+        h_nbrs, h_edges, h_times, priors_np = self.horizon_sampler.sample_stl_5views(node_ids, node_interact_times)
+        priors = torch.from_numpy(priors_np).float().to(self.device)
 
         # Target node intrinsic embedding (for bypass & inductive nodes)
         target_tensor = torch.from_numpy(node_ids).long().to(self.device)
@@ -171,8 +206,8 @@ class EvidGNN(nn.Module):
 
         query_ts = torch.from_numpy(node_interact_times).float().to(self.device).unsqueeze(1) # (B, 1)
 
-        horizon_embeddings = []
-        for m in range(3):
+        view_tokens = []
+        for m in range(5):
             nbr_t = torch.from_numpy(h_nbrs[m]).long().to(self.device)   # (B, L)
             edge_t = torch.from_numpy(h_edges[m]).long().to(self.device) # (B, L)
             time_t = torch.from_numpy(h_times[m]).float().to(self.device) # (B, L)
@@ -211,23 +246,44 @@ class EvidGNN(nn.Module):
             has_history = valid_mask.any(dim=-1, keepdim=True).float() # (B, 1)
             z_m = (z_m * has_history) + target_emb
 
-            horizon_embeddings.append(z_m)
+            view_tokens.append(z_m)
 
-        return horizon_embeddings[0], horizon_embeddings[1], horizon_embeddings[2]
+        tokens = torch.stack(view_tokens, dim=1) # (B, 5, hidden_dim)
+        return tokens, priors
 
-    def compute_multihorizon_contrastive_loss(self, z0: torch.Tensor, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
+    def _attend_and_fuse(self, tokens: torch.Tensor, priors: torch.Tensor) -> torch.Tensor:
         """
-        Computes symmetric InfoNCE contrastive loss across the three evidence horizons.
-        Forces multi-scale temporal scale invariance across burst, trend, and anchor views.
+        Conditions the 5 physical view tokens with STL physical priors and horizon positional embeddings,
+        passes through the Dynamic Graph Transformer Self-Attention block, and fuses to node_feat_dim.
         """
-        p0 = F.normalize(self.proj_head(z0), dim=-1)
-        p1 = F.normalize(self.proj_head(z1), dim=-1)
-        p2 = F.normalize(self.proj_head(z2), dim=-1)
+        B = tokens.size(0)
+        prior_emb = self.prior_proj(priors) # (B, hidden_dim)
+        pos = self.horizon_pos_emb(torch.arange(5, device=self.device)) # (5, hidden_dim)
 
-        B = z0.size(0)
+        # Condition tokens with horizon semantics + physical priors
+        x = tokens + pos.unsqueeze(0) + prior_emb.unsqueeze(1) # (B, 5, hidden_dim)
+
+        # Dynamic Graph Transformer Self-Attention
+        tokens_attended = self.transformer(x) # (B, 5, hidden_dim)
+
+        # Fusion to output node representation
+        out = self.fusion(tokens_attended.reshape(B, 5 * self.hidden_dim)) # (B, node_feat_dim)
+        return out
+
+    def compute_multihorizon_contrastive_loss(self, tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Computes symmetric InfoNCE contrastive loss across canonical physical scale pairs:
+          - (0, 1): Seasonality vs Trend
+          - (1, 4): Trend vs Long Burst
+          - (2, 3): Short vs Medium Burst
+          - (3, 4): Medium vs Long Burst
+          - (0, 2): Seasonality vs Short Burst
+        """
+        B = tokens.size(0)
         if B < 2:
             return torch.tensor(0.0, device=self.device)
 
+        p = [F.normalize(self.proj_head(tokens[:, m]), dim=-1) for m in range(5)]
         targets = torch.arange(B, device=self.device)
 
         def pair_infonce(a, b):
@@ -235,27 +291,30 @@ class EvidGNN(nn.Module):
             sim_ba = torch.mm(b, a.t()) / self.temperature
             return 0.5 * (F.cross_entropy(sim_ab, targets) + F.cross_entropy(sim_ba, targets))
 
-        loss = (pair_infonce(p0, p1) + pair_infonce(p1, p2) + pair_infonce(p0, p2)) / 3.0
+        loss = (pair_infonce(p[0], p[1]) +
+                pair_infonce(p[1], p[4]) +
+                pair_infonce(p[2], p[3]) +
+                pair_infonce(p[3], p[4]) +
+                pair_infonce(p[0], p[2])) / 5.0
         return loss
 
     def compute_src_dst_node_temporal_embeddings(self, src_node_ids: np.ndarray, dst_node_ids: np.ndarray,
                                                  node_interact_times: np.ndarray, **kwargs):
-        src_z0, src_z1, src_z2 = self._encode_node_horizons(src_node_ids, node_interact_times)
-        dst_z0, dst_z1, dst_z2 = self._encode_node_horizons(dst_node_ids, node_interact_times)
+        src_tokens, src_priors = self._encode_node_horizons(src_node_ids, node_interact_times)
+        dst_tokens, dst_priors = self._encode_node_horizons(dst_node_ids, node_interact_times)
 
         if self.training:
-            src_cl = self.compute_multihorizon_contrastive_loss(src_z0, src_z1, src_z2)
-            dst_cl = self.compute_multihorizon_contrastive_loss(dst_z0, dst_z1, dst_z2)
+            src_cl = self.compute_multihorizon_contrastive_loss(src_tokens)
+            dst_cl = self.compute_multihorizon_contrastive_loss(dst_tokens)
             self.current_contrastive_loss = 0.5 * (src_cl + dst_cl)
         else:
             self.current_contrastive_loss = torch.tensor(0.0, device=self.device)
 
-        # Multi-scale Horizon Fusion
-        src_embeddings = self.fusion(torch.cat([src_z0, src_z1, src_z2], dim=-1))
-        dst_embeddings = self.fusion(torch.cat([dst_z0, dst_z1, dst_z2], dim=-1))
+        src_embeddings = self._attend_and_fuse(src_tokens, src_priors)
+        dst_embeddings = self._attend_and_fuse(dst_tokens, dst_priors)
 
         return src_embeddings, dst_embeddings
 
     def compute_node_temporal_embeddings(self, node_ids: np.ndarray, node_interact_times: np.ndarray, **kwargs):
-        z0, z1, z2 = self._encode_node_horizons(node_ids, node_interact_times)
-        return self.fusion(torch.cat([z0, z1, z2], dim=-1))
+        tokens, priors = self._encode_node_horizons(node_ids, node_interact_times)
+        return self._attend_and_fuse(tokens, priors)
